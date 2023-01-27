@@ -1,6 +1,7 @@
 import requests
 import json
 import time
+import sys
 
 base_url = "http://localhost:8181/onos/v1/"
 
@@ -139,8 +140,8 @@ def flow_rule_gen(s,port1,port2):
         return data_in_str
 
 if __name__ == '__main__':
-	path = setup_flow("00:00:00:00:00:01/None","00:00:00:00:00:02/None")
+	path = setup_flow(str(sys.argv[1]),str(sys.argv[2]))
 	continously_monitoring(path)
 	print("establishing new path..................")
 	remove_all_flows()
-	path = setup_flow("00:00:00:00:00:01/None","00:00:00:00:00:02/None")
+	path = setup_flow(str(sys.argv[1]),str(sys.argv[2]))
