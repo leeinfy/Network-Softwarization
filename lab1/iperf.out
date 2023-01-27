@@ -1,0 +1,2 @@
+iperf h1 h2:['4.69 Mbits/sec', '6.07 Mbits/sec']
+iperf h1 h3:['4.74 Mbits/sec', '6.14 Mbits/sec']
