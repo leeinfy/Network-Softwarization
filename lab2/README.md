@@ -11,4 +11,4 @@ In `flows.py` terminal will indicate the path is fail and then replace with a ne
 
 <br>
 <br>
-<b>any json error will relate to ONOS would not be able to find all the link, hosts, or devices<b>
+<b>Any json error is caused by ONOS fail to find all the links, hosts, or devices<b>
