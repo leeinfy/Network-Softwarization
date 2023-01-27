@@ -11,6 +11,6 @@ In `flows.py` terminal will indicate the path is fail and then replace with a ne
 <br>
 <br>
 Any json error is caused by ONOS fail to find all the links, hosts, or devices <br>
-Use `links`, `devices`, `hosts` to varify your mininet topology is same as ONOS control plane <br>
+Use `links`, `devices`, `hosts` to varify your mininet topology is ONOS<br>
 The path setup is base on PATH rest api of ONOS, if there is not result using `paths` command, the `flows.py` will fail
 
