@@ -127,7 +127,7 @@ def continously_monitoring(path_list):
                                         if ports_json['ports'][j]['isEnabled'] == False :
                                                 print("path is failed")
                                                 return
-        time.sleep(5)
+        	time.sleep(3)
 
 
 #generate the json for flow rule
