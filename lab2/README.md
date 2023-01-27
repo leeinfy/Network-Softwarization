@@ -7,3 +7,4 @@ Then Run command `python flows.py` in a new terminal<br>
 Mininet command `h1 ping h2` or `h2 ping h1` would work<br>
 Then run command `link s1 s2 down` in mininet<br>
 In `flows.py` terminal will indicate the path is fail and then replace with a new flow entries
+![terminal result](output.png "terminal result")
