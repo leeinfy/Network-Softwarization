@@ -141,7 +141,8 @@ def flow_rule_gen(s,port1,port2):
 
 if __name__ == '__main__':
 	path = setup_flow(str(sys.argv[1]),str(sys.argv[2]))
-	continously_monitoring(path)
-	print("establishing new path..................")
-	remove_all_flows()
-	path = setup_flow(str(sys.argv[1]),str(sys.argv[2]))
+	while(1):
+		continously_monitoring(path)
+		print("establishing new path..................")
+		remove_all_flows()
+		path = setup_flow(str(sys.argv[1]),str(sys.argv[2]))
