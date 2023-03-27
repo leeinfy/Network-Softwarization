@@ -1,0 +1,421 @@
+#!/usr/bin/env python
+import os
+import sys
+import time
+import random
+import paramiko
+import logging
+from novaclient import client
+
+# Config file, put your credentials in overlay_config.py
+import overlay_config
+
+# Set logging format and logging level
+# Can change INFO to DEBUG for more information, or WARNING for less information
+logging.basicConfig(format='%(asctime)s %(module)s %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__) # Get logger for *this* module
+logger.setLevel(logging.INFO)
+
+# List of used VNIs in the overlay
+USED_VNIS = []
+
+# List of used IP
+USED_IP = []
+
+################################################################################
+# HELPER FUNCTIONS (PRE-MADE FOR STUDENTS)
+################################################################################
+
+# Waits until a given VM is active
+#
+# Input:
+#   - vmObj: A VM object created by Nova
+def waitUntilVMActive(vmObj):
+    while vmObj.status != 'ACTIVE':
+        logger.debug("Waiting for VM %s to become active..." % vmObj.name)
+        time.sleep(5)
+        vmObj.get() # Re-sync object state w/ OpenStack
+
+    logger.info("VM %s is now active" % vmObj.name)
+
+# Sets up an SSH session with a target host
+#
+# Input:
+#   - targetIP: The target host's IP address
+#   - username: The username to log-in with
+#   - password: The password associated with the username
+#
+# Returns:
+#   - A Paramiko SSH session object
+def getSSHSession(targetIP, username, password):
+    # Set up SSH
+    sshSession = paramiko.SSHClient()
+    sshSession.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    while True:
+        try:
+            sshSession.connect(targetIP, username = username, password = password)
+            logger.debug("SSH to %s successful" % targetIP)
+            break
+        except Exception as e:
+            logger.debug("Waiting for SSH daemon to come up in %s..." % targetIP)
+            time.sleep(5)
+
+    return sshSession
+
+# Runs a command over an established SSH session
+#
+# Input:
+#   - sshSession: An active SSH session to a VM
+#   - command: A string command to run within the VM
+#
+# Returns:
+#   - A tuple containing strings of stdout and stderr (stdout, stderr), or
+#     else None if an exception occurred from SSH
+def runCommandOverSSH(sshSession, command):
+    assert type(sshSession) is paramiko.client.SSHClient,\
+            "'sshSession' is type %s" % type(sshSession)
+    assert type(command) is str, "'command' is type %s" % type(command)
+    logger.debug("Running command in host %s" % sshSession._transport.sock.getpeername()[0])
+    logger.debug("\t\"%s\"" % command)
+
+    try:
+        stdin, stdout, stderr = sshSession.exec_command(command)
+
+        # Wait for command to finish (may take a while for long commands)
+        while not stdout.channel.exit_status_ready() or \
+                not stderr.channel.exit_status_ready():
+            time.sleep(1)
+    except Exception as e:
+        logger.error(e)
+        logger.error("ERROR: Unable to execute command over SSH:")
+        logger.error("\t%s" % command)
+
+        return None
+    else:
+        # exec_command() completed successfully
+        # Check if command printed anything to stderr
+        err = stderr.readlines()
+        err = ''.join(err) # Convert to single string
+        if err:
+            logger.error("%s\n" % err)
+
+        # Check if command printed anything to stdout
+        out = stdout.readlines()
+        out = ''.join(out) # Convert to single string
+        if out:
+            logger.debug("%s\n" % out)
+
+        return (out, err)
+
+# Ensures the OVS daemon is up before continuing. If OVS isn't installed in the
+# system, it will be installed first. Assumes the host is a Debian-based OS
+# using the aptitude package management system.
+#
+# Input:
+#   - sshSession: An active SSH session to a VM
+def waitUntilOVSActive(sshSession):
+    assert type(sshSession) is paramiko.client.SSHClient,\
+            "'sshSession' is type %s" % type(sshSession)
+
+    # Check if OVS is installed, install if it's not
+    cmd = "dpkg -l | grep openvswitch"
+    stdout, stderr = runCommandOverSSH(sshSession, cmd)
+    if not stdout: # dpkg -l didn't find anything
+        logger.info("Open vSwitch is not installed, installing now...")
+        cmd = "sudo apt-get update && sudo apt-get install -y openvswitch-switch"
+        stdout, stderr = runCommandOverSSH(sshSession, cmd)
+
+    cmd = "sudo service openvswitch-switch status"
+    stdout, stderr = runCommandOverSSH(sshSession, cmd)
+    while "not running" in stdout:
+        logger.debug("Waiting for OVS to become active")
+        time.sleep(5)
+        stdout, stderr = runCommandOverSSH(sshSession, cmd)
+
+# Generates a unique VXLAN Network Identifier (VNI)
+# Ensures generated number isn't being used in the overlay
+#
+# Returns:
+#   - A randomly generated number between 1 and 65536
+def generateVNI():
+    global USED_VNIS
+
+    vni = random.randint(1, 2**16)
+    while vni in USED_VNIS:
+        vni = random.randint(1, 2**16)
+
+    USED_VNIS.append(vni)
+    return vni
+
+# Sets controller for OVS within a switch VM to a TCP endpoint
+#
+# Input:
+#   - switchVMObj: A VM object created by Nova
+#   - ctrlEndpoint: A string of the TCP endpoint for setting the OVS controller
+#       - Example: "10.20.30.40:6633"
+def setController(switchVMObj, ctrlEndpoint):
+    logger.info("Setting controller for switch in %s with IP %s" %
+                                    (switchVMObj.name, ctrlEndpoint))
+    networkName = overlay_config.tenant_name + '-net'
+
+    switchVMIP = switchVMObj.networks.get(networkName)[0]
+    switchSSH = getSSHSession(switchVMIP, 'ubuntu', 'savi')
+
+    # Ensure OVS daemon is up and running
+    waitUntilOVSActive(switchSSH)
+
+    # Set to OpenFlow 1.0
+    ovsName = "%s-br" % switchVMObj.name
+    cmd = "sudo ovs-vsctl set bridge %s protocols=OpenFlow10" % ovsName
+    runCommandOverSSH(switchSSH, cmd)
+
+    # Set the controller
+    cmd = "sudo ovs-vsctl set-controller %s tcp:%s" % (ovsName, ctrlEndpoint)
+    runCommandOverSSH(switchSSH, cmd)
+
+################################################################################
+# HELPER FUNCTIONS (TO BE COMPLETED BY STUDENTS)
+################################################################################
+# Creates a VM using OpenStack Nova
+#
+# Input:
+#   - vmName: Name of desired VM to be created, must be of type string
+#
+# Returns:
+#   - The VM object created by Nova
+def bootVM(vmName):
+    assert type(vmName) == str, "'vmName' is type %s" % type(vmName)
+
+    # Pre-pend vmName with your username
+    vmName = overlay_config.username + '-' + vmName
+
+    logger.info("Creating VM %s" % vmName)
+
+    #create an vm instance
+    return nova.servers.create(vmName, image, flavor, key_name=overlay_config.key_name,security_groups=[overlay_config.username], nics=[{'net-id': net.id}])
+
+
+# Creates an OVS switch and an internal interface for it, and sets
+# the interface's IP to the specified IP address.
+# Currently, the default CIDR is /24 for whichever IP is specified.
+# The MTU over the created interface is set to 1450 to account for
+# the extra headers introduced by VXLAN.
+#
+# Input:
+#   - hostVMObj: A VM object created by Nova
+#   - hostOverlayIP: Desired overlay IP for the host
+def setOverlayInterface(hostVMObj, hostOverlayIP):
+    logger.info("Setting overlay for %s with IP %s" %
+                        (hostVMObj.name, hostOverlayIP))
+    networkName = overlay_config.tenant_name + '-net'
+
+    hostVMIP = hostVMObj.networks.get(networkName)[0]
+    hostSSH = getSSHSession(hostVMIP, 'ubuntu', 'savi')
+
+    # Ensure OVS daemon is up and running
+    waitUntilOVSActive(hostSSH)
+
+    # Creates OVS switch with name of host + '-br'
+    ovsName = "%s-br" % hostVMObj.name
+
+    logger.info("Setting ovs bridge for %s" % hostVMObj.name)
+    cmd = "sudo ovs-vsctl --may-exist add-br %s" % ovsName
+    runCommandOverSSH(hostSSH, cmd)
+
+    # add interanl interface two ovs instance
+    ovsInterName = "Internal"
+    logger.info("Setting ovs internal interface for %s" % hostVMObj.name)
+    cmd = "sudo ovs-vsctl --may-exist add-port %s %s -- set interface %s type=internal" %(ovsName,ovsInterName,ovsInterName)
+    runCommandOverSSH(hostSSH, cmd)
+
+    # assign a ip to that interanl interface
+    logger.info("Assign %s to %s internal interface" % (hostOverlayIP, hostVMObj.name))
+    cmd = "sudo ifconfig %s %s/24 mtu 1450 up" % (ovsInterName, hostOverlayIP)
+    runCommandOverSSH(hostSSH, cmd)
+
+# Connects two nodes as part of an overlay.
+# Nodes can be either a host or a switch object, but generally at least
+# one of them should be a switch.
+#
+# Input:
+#   - node1: A VM object created by Nova
+#   - node2: A VM object created by Nova
+def connectNodes(node1, node2):
+    logger.info("Making VXLAN links between %s and %s" % (node1.name, node2.name))
+    networkName = overlay_config.tenant_name + '-net'
+
+    node1IP = node1.networks.get(networkName)[0]
+    node1SSH = getSSHSession(node1IP, 'ubuntu', 'savi')
+
+    node2IP = node2.networks.get(networkName)[0]
+    node2SSH = getSSHSession(node2IP, 'ubuntu', 'savi')
+
+    # Ensure OVS daemon is up and running in both nodes
+    waitUntilOVSActive(node1SSH)
+    waitUntilOVSActive(node2SSH)
+
+    global vxlankey
+    ovsName1 = "%s-br" % node1.name
+    ovsName2 = "%s-br" % node2.name
+    vxlanInt1 = "vxlan%s" % node2.name.split('-')[-1]
+    vxlanInt2 = "vxlan%s" % node1.name.split('-')[-1]
+    logger.info("Setting ovs vxlan interface for %s" % ovsName1)
+    cmd1 = "sudo ovs-vsctl --may-exist add-port %s %s -- set interface %s type=vxlan options:remote_ip=%s options:key=%s" %(ovsName1,vxlanInt1,vxlanInt1,node2IP,vxlankey)
+    runCommandOverSSH(node1SSH, cmd1)
+    logger.info("Setting ovs vxlan interface for %s" % ovsName2)
+    cmd2 = "sudo ovs-vsctl --may-exist add-port %s %s -- set interface %s type=vxlan options:remote_ip=%s options:key=%s" %(ovsName2,vxlanInt2,vxlanInt2,node1IP,vxlankey)
+    runCommandOverSSH(node2SSH, cmd2)
+
+################################################################################
+# PRIMARY FUNCTIONS (CALLED FROM MAIN, TO BE COMPLETED BY STUDENTS)
+################################################################################
+
+# Deploys the overlay topology specified within the overlay_config.py file
+# This involves:
+#   - Booting up the VMs
+#   - Configuring VMs intended as the overlay hosts
+#   - Interconnecting everything using OVS's VXLAN capabilities
+def deployOverlay():
+    print ("In deployOverlay()")
+
+    # Dictionaries to map switch/host names to their Nova VM objects
+    switchVMList = []
+    hostVMList = []
+
+    #loop over topology, boot vm, config the role.
+    for i, x in enumerate(overlay_config.topology):
+        #boot swith vm
+        switchVMList.append(bootVM(x)) 
+        waitUntilVMActive(switchVMList[i])
+        #create an OVS bridge, and assign an internal interface with a random IPv4
+        setOverlayInterface(switchVMList[i], GetRandomHostOverlayIP())
+        #set controller to the switch vm
+        setController(switchVMList[i],overlay_config.ctlEndpoint)
+        for y in overlay_config.topology[x]:
+            #the element is a host with specific ip address
+            if(type(y)) == tuple:
+                #boot host vm and assign a vxland ip to it
+                hostVMList.append(bootVM(y[0]))
+                waitUntilVMActive(hostVMList[-1])
+                #create an OVS bridge, and assign an internal interface with an IPv4 listed in topology
+                setOverlayInterface(hostVMList[-1], y[1])
+                #connect the sw and the host with vxlan interface
+                connectNodes(switchVMList[i], hostVMList[-1])
+            else:
+                #the element is a switch, find the correspoding switch
+                for k, z in enumerate(overlay_config.topology):
+                    if z  == y:
+                        #connect the two sw with vxlan interface
+                        connectNodes(switchVMList[i], switchVMList[k])
+
+# Lists any VM that starts with your username and a dash
+# Example: If your username is netsoft50 and a VM is named netsoft50-h1, it
+#          gets listed. But if it's netsoft50h1, ignore it.
+#
+# Expected output format should conform to the following format:
+#   <VM Name>: <VM UUID> (<VM Underlay IP>)
+#
+# Example:
+#   netsoft50-h1: 8563c070-bddc-48c8-ba0f-1fd882ec47a1 (10.12.69.4)
+def listOverlay():
+    print ("In listOverlay()")
+
+    VMlist = {}
+    #list all vm with name start with netsoft10-
+    vmlist = nova.servers.list()
+    for x in vmlist:
+        if x.name[0:len(overlay_config.username)+1] == (overlay_config.username + "-") :
+            VMlist[x.name]= (x.id, getVMIP(x))
+    print(VMlist)
+
+# Just cleans up any VM that starts with your username and a dash
+# Example: If your username is netsoft50 and a VM is named netsoft50-h1, it
+#          gets deleted. But if it's netsoft50h1, ignore it.
+def cleanupOverlay():
+    print ("In cleanupOverlay()")
+
+    #delete all vm with name start with netsoft10-
+    vmlist = nova.servers.list()
+    for x in vmlist:
+        if x.name[0:len(overlay_config.username)+1] == (overlay_config.username + "-") :
+            x.delete()
+
+def getVMIP(vmobj):
+    return vmobj.networks.get(overlay_config.tenant_name + '-net')[0]
+
+def GetRandomHostOverlayIP():
+    global USED_IP
+
+    ip = random.randint(1, 2**8-2)
+    while ip in USED_IP:
+        ip = random.randint(1, 2**8-2)
+
+    USED_IP.append(ip)
+    return "192.168.200.%s" % str(ip)
+
+def printHelp():
+    print ("Usage: ./saviOverlay [subcommand]")
+    print ("\tTo print this help message again, run: ./saviOverlay help")
+    print ("\tTo deploy a topology, run: ./saviOverlay deploy")
+    print ("\tTo list existing VMs from past deployments, run: ./saviOverlay list")
+    print ("\tTo clean up old topology nodes, run: ./saviOverlay cleanup")
+    return
+
+# established a nove client
+nova = client.Client(
+    "2", auth_url=overlay_config.auth_url, 
+    username=overlay_config.username,
+    password=overlay_config.password, 
+    project_name=overlay_config.tenant_name,
+    region_name=overlay_config.region,
+    project_domain_name="Default", 
+    user_domain_name="Default",
+    os_cache=False)
+#find the underlay network
+net = nova.neutron.find_network(overlay_config.tenant_name + "-net")
+#find the flavors
+flavor = nova.flavors.find(name=overlay_config.flavor)
+#find the image
+image = nova.glance.find_image(overlay_config.image)
+
+vxlankey = generateVNI()
+
+#store the ip used in topology
+for x in overlay_config.topology:
+    for y in overlay_config.topology[x]:
+        assert type(y) == tuple or type(y) == str , "could not read overlay topology config"
+        if(type(y)) == tuple:
+            ip=y[1].split('.')
+            USED_IP.append(int(ip[3]))
+
+if __name__ == "__main__":
+    SUBCOMMANDS = ('help', 'deploy', 'list', 'cleanup')
+
+    if len(sys.argv) > 2:
+        print ("ERROR: Incorrect # of args")
+        printHelp()
+        sys.exit();
+    else:
+        if len(sys.argv) == 2:
+            if sys.argv[1] not in SUBCOMMANDS:
+                print ("ERROR: Unknown subcommand argument.")
+                print ("       Currently subaccepted commands are: %s" % str(SUBCOMMANDS).strip('()'))
+                printHelp()
+                sys.exit();
+
+    if len(sys.argv) == 1:
+        # Called with no arguments
+        printHelp()
+    elif len(sys.argv) == 2:
+        if sys.argv[1] == "help":
+            printHelp()
+        elif sys.argv[1] == "deploy":
+            deployOverlay()
+        elif sys.argv[1] == "list":
+            listOverlay()
+        elif sys.argv[1] == "cleanup":
+            cleanupOverlay()
+
+    sys.exit();
+
